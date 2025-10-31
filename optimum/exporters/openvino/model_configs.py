@@ -104,6 +104,7 @@ from .model_patcher import (
     InternVL2ChatLangModelPatcher,
     InternVLChatImageEmbeddingModelPatcher,
     JaisModelPatcher,
+    LFM2ModelPatcher,
     Llama4ImageEmbeddingsModelPatcher,
     Llama4TextModelPatcher,
     LlavaImageEmbeddingModelPatcher,
@@ -4386,3 +4387,165 @@ class Zamba2OpenVINOConfig(MambaOpenVINOConfig):
         if self.use_past_in_inputs:
             self.add_past_key_values(common_inputs, direction="inputs")
         return common_inputs
+
+
+class LFM2DummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
+    """
+    Generates dummy past_key_values and conv_states inputs for LFM2 architectures.
+    
+    LFM2 has a hybrid design alternating between Grouped Query Attention (GQA) blocks
+    and short convolutional layers, requiring both KV cache and convolutional state.
+    """
+
+    SUPPORTED_INPUT_NAMES = ("past_key_values", "conv_states")
+
+    def __init__(
+        self,
+        task: str,
+        normalized_config,
+        batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+        sequence_length: int = DEFAULT_DUMMY_SHAPES["sequence_length"],
+        **kwargs,
+    ):
+        super().__init__(
+            task=task,
+            normalized_config=normalized_config,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            **kwargs,
+        )
+        config = normalized_config.config
+        # LFM2 specific configuration
+        self.num_key_value_heads = getattr(config, "num_key_value_heads", self.num_attention_heads)
+        self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_attention_heads)
+        self.conv_kernel_size = getattr(config, "conv_kernel_size", 4)
+        self.intermediate_size = getattr(config, "intermediate_size", self.hidden_size)
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        if input_name == "past_key_values":
+            # Generate standard KV cache for attention layers
+            kv_shape = (
+                self.batch_size,
+                self.num_key_value_heads,
+                self.sequence_length,
+                self.head_dim,
+            )
+            return [
+                (
+                    self.random_float_tensor(kv_shape, framework=framework, dtype=float_dtype),
+                    self.random_float_tensor(kv_shape, framework=framework, dtype=float_dtype),
+                )
+                for _ in range(self.num_layers)
+            ]
+        elif input_name == "conv_states":
+            # Generate convolutional state for conv layers
+            conv_shape = (
+                self.batch_size,
+                self.intermediate_size,
+                self.conv_kernel_size,
+            )
+            return [
+                self.random_float_tensor(conv_shape, framework=framework, dtype=float_dtype)
+                for _ in range(self.num_layers)
+            ]
+        
+        raise ValueError(f"Unsupported input name {input_name}")
+
+
+@register_in_tasks_manager("lfm2", *["text-generation", "text-generation-with-past"], library_name="transformers")
+class LFM2OpenVINOConfig(TextDecoderWithPositionIdsOnnxConfig):
+    """
+    OpenVINO configuration for LFM2 model.
+    
+    LFM2 uses a hybrid architecture that alternates between Grouped Query Attention (GQA)
+    blocks and short convolutional layers. This requires special handling during export
+    to manage both the attention KV cache and convolutional state.
+    """
+    DEFAULT_ONNX_OPSET = 14
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, LFM2DummyPastKeyValuesGenerator)
+    DUMMY_PKV_GENERATOR_CLASS = LFM2DummyPastKeyValuesGenerator
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+    _MODEL_PATCHER = LFM2ModelPatcher
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        common_inputs = {
+            "input_ids": {0: "batch_size", 1: "sequence_length"},
+            "attention_mask": {0: "batch_size", 1: "sequence_length"},
+            "position_ids": {0: "batch_size", 1: "sequence_length"},
+        }
+        if self.use_past_in_inputs:
+            self.add_past_key_values(common_inputs, direction="inputs")
+            self.add_conv_states(common_inputs, direction="inputs")
+        return common_inputs
+
+    def add_past_key_values(self, inputs_or_outputs: Dict[str, Dict[int, str]], direction: str):
+        """
+        Fills `inputs_or_outputs` mapping with past_key_values dynamic axes considering the direction.
+        
+        Args:
+            inputs_or_outputs (`Dict[str, Dict[int, str]]`): The mapping to fill.
+            direction (`str`): either "inputs" or "outputs"
+        """
+        if direction not in ["inputs", "outputs"]:
+            raise ValueError(f'direction must either be "inputs" or "outputs", but {direction} was given')
+
+        if direction == "inputs":
+            decoder_sequence_name = "past_sequence_length"
+            name = "past_key_values"
+        else:
+            decoder_sequence_name = "past_sequence_length + sequence_length"
+            name = "present"
+
+        for i in range(self._normalized_config.num_layers):
+            inputs_or_outputs[f"{name}.{i}.key"] = {0: "batch_size", 2: decoder_sequence_name}
+            inputs_or_outputs[f"{name}.{i}.value"] = {0: "batch_size", 2: decoder_sequence_name}
+
+    def add_conv_states(self, inputs_or_outputs: Dict[str, Dict[int, str]], direction: str):
+        """
+        Fills `inputs_or_outputs` mapping with conv_states dynamic axes considering the direction.
+        
+        Args:
+            inputs_or_outputs (`Dict[str, Dict[int, str]]`): The mapping to fill.
+            direction (`str`): either "inputs" or "outputs"
+        """
+        if direction not in ["inputs", "outputs"]:
+            raise ValueError(f'direction must either be "inputs" or "outputs", but {direction} was given')
+
+        if direction == "inputs":
+            name = "past_conv_states"
+        else:
+            name = "present_conv_states"
+
+        for i in range(self._normalized_config.num_layers):
+            inputs_or_outputs[f"{name}.{i}"] = {0: "batch_size"}
+
+    def generate_dummy_inputs(self, framework: str = "pt", **kwargs):
+        """
+        Override to handle both KV cache and convolutional states.
+        """
+        dummy_inputs_generators = self._create_dummy_input_generator_classes(**kwargs)
+
+        dummy_inputs = {}
+        input_names = [key for key in self.inputs.keys() if not key.startswith("past_key_values") and not key.startswith("past_conv_states")]
+        if self.use_past_in_inputs:
+            input_names.extend(["past_key_values", "conv_states"])
+
+        for input_name in input_names:
+            input_was_inserted = False
+            for dummy_input_gen in dummy_inputs_generators:
+                if dummy_input_gen.supports_input(input_name):
+                    dummy_inputs[input_name] = self.overwrite_shape_and_generate_input(
+                        dummy_input_gen,
+                        input_name,
+                        framework,
+                        input_shapes=kwargs,
+                    )
+                    input_was_inserted = True
+                    break
+            if not input_was_inserted:
+                raise RuntimeError(
+                    f'Could not generate dummy input for "{input_name}". Try adding a proper dummy input generator to the model ONNX config.'
+                )
+
+        return dummy_inputs

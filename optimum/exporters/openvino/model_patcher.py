@@ -6954,3 +6954,153 @@ class Zamba2ModelPatcher(ModelPatcher):
             else:
                 continue
             mamba_layer.forward = mamba_layer._orig_forward
+
+
+# LFM2 attention forward with SDPA for efficient export
+def _lfm2_attention_sdpa_forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    cache_position: Optional[torch.LongTensor] = None,
+    **kwargs,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    """
+    LFM2 attention forward pass using Scaled Dot-Product Attention (SDPA).
+    This is more efficient for ONNX/OpenVINO export.
+    """
+    bsz, q_len, _ = hidden_states.size()
+
+    # Project to Q, K, V
+    query_states = self.q_proj(hidden_states)
+    key_states = self.k_proj(hidden_states)
+    value_states = self.v_proj(hidden_states)
+
+    # Reshape for multi-head attention
+    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+    # Apply rotary position embeddings if available
+    if hasattr(self, 'rotary_emb') and position_ids is not None:
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    # Handle past key values for caching
+    if past_key_value is not None:
+        key_states = torch.cat([past_key_value[0], key_states], dim=2)
+        value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+    past_key_value = (key_states, value_states) if use_cache else None
+
+    # Repeat k/v heads if num_key_value_heads < num_heads (GQA)
+    if self.num_key_value_heads != self.num_heads:
+        key_states = repeat_kv(key_states, self.num_heads // self.num_key_value_heads)
+        value_states = repeat_kv(value_states, self.num_heads // self.num_key_value_heads)
+
+    # Apply SDPA
+    if output_attentions:
+        # Fall back to manual attention computation if we need attention weights
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+
+        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+    else:
+        attn_output = F.scaled_dot_product_attention(
+            query_states, key_states, value_states, attn_mask=attention_mask
+        )
+        attn_weights = None
+
+    # Reshape and project output
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+    attn_output = self.o_proj(attn_output)
+
+    return attn_output, attn_weights, past_key_value
+
+
+# Vectorized conv forward to avoid control flow during ONNX conversion
+def _vectorized_conv_forward(
+    self,
+    hidden_states: torch.Tensor,
+    conv_state: Optional[torch.Tensor] = None,
+    cache_position: Optional[torch.LongTensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Vectorized convolutional forward pass for LFM2.
+    This avoids control flow that can cause issues during ONNX conversion.
+    """
+    batch_size, seq_len, hidden_dim = hidden_states.shape
+    
+    # Apply convolution
+    # Transpose to [batch, hidden_dim, seq_len] for conv1d
+    hidden_states_transposed = hidden_states.transpose(1, 2)
+    
+    if conv_state is not None:
+        # Decoding step: use cached state
+        # Update conv state by rolling and inserting new values
+        new_conv_state = torch.cat([conv_state[:, :, 1:], hidden_states_transposed], dim=2)
+        
+        # Apply convolution on the updated state
+        conv_output = F.conv1d(
+            new_conv_state,
+            self.conv.weight,
+            self.conv.bias if hasattr(self.conv, 'bias') else None,
+            padding=0
+        )
+    else:
+        # Prefill step: apply convolution directly
+        conv_output = self.conv(hidden_states_transposed)
+        # Initialize conv state for next iterations
+        kernel_size = self.conv.weight.shape[2]
+        new_conv_state = F.pad(hidden_states_transposed, (kernel_size - 1, 0))[:, :, :kernel_size]
+    
+    # Transpose back to [batch, seq_len, hidden_dim]
+    conv_output = conv_output.transpose(1, 2)
+    
+    # Apply activation if available
+    if hasattr(self, 'activation'):
+        conv_output = self.activation(conv_output)
+    
+    return conv_output, new_conv_state
+
+
+class LFM2ModelPatcher(ModelPatcher):
+    """
+    Model patcher for LFM2 architecture.
+    
+    This patcher modifies the LFM2 model's forward pass for export:
+    1. Patches attention layers to use SDPA implementation for efficiency
+    2. Patches convolutional layers to use vectorized forward pass to avoid control flow
+    """
+    
+    def __enter__(self):
+        super().__enter__()
+        
+        # Patch attention layers with SDPA
+        for layer in self._model.model.layers:
+            if hasattr(layer, 'self_attn'):
+                layer.self_attn._orig_forward = layer.self_attn.forward
+                layer.self_attn.forward = types.MethodType(_lfm2_attention_sdpa_forward, layer.self_attn)
+            
+            # Patch convolutional layers
+            if hasattr(layer, 'conv_layer'):
+                layer.conv_layer._orig_forward = layer.conv_layer.forward
+                layer.conv_layer.forward = types.MethodType(_vectorized_conv_forward, layer.conv_layer)
+    
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        
+        # Restore original forward methods
+        for layer in self._model.model.layers:
+            if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, '_orig_forward'):
+                layer.self_attn.forward = layer.self_attn._orig_forward
+            
+            if hasattr(layer, 'conv_layer') and hasattr(layer.conv_layer, '_orig_forward'):
+                layer.conv_layer.forward = layer.conv_layer._orig_forward
